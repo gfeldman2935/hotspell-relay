@@ -3,15 +3,22 @@ HotSpell Relay Server
 Deploy on Railway (or any host with a public TCP port).
 Two players connect with a shared 6-character room code;
 the server pairs them and forwards bytes transparently.
-Handles Railway HTTP health checks on the same port.
+
+Railway requires a web process to respond to HTTP health checks.
+This server runs a minimal HTTP health-check listener on PORT (Railway's
+assigned HTTP port) and the relay on RELAY_PORT (our TCP proxy target).
 """
 import os, socket, threading, secrets, time
 
-PORT = int(os.environ.get('RELAY_PORT', os.environ.get('PORT', 8080)))
+# Railway assigns PORT for its HTTP health-check; we use RELAY_PORT for the relay.
+HTTP_PORT  = int(os.environ.get('PORT', 0))          # Railway health-check port
+RELAY_PORT = int(os.environ.get('RELAY_PORT', 8080)) # TCP proxy target port
 
-_rooms: dict = {}   # code -> {'host': conn, 'guest': None, 'event': Event, 'ts': float}
+_rooms: dict = {}
 _lock         = threading.Lock()
 
+
+# ── Cleanup stale rooms ───────────────────────────────────────────────────────
 def _cleanup():
     while True:
         time.sleep(60)
@@ -28,6 +35,7 @@ def _cleanup():
 threading.Thread(target=_cleanup, daemon=True).start()
 
 
+# ── Byte-pipe between two sockets ─────────────────────────────────────────────
 def _pipe(src: socket.socket, dst: socket.socket):
     try:
         while True:
@@ -45,50 +53,27 @@ def _pipe(src: socket.socket, dst: socket.socket):
             except Exception: pass
 
 
-def _readline(conn: socket.socket) -> tuple:
-    """Read first line; also return any bytes already peeked."""
+# ── Read one line from socket ─────────────────────────────────────────────────
+def _readline(conn: socket.socket) -> str:
     buf = b''
     while len(buf) < 64:
         try:
             b = conn.recv(1)
         except Exception:
-            return '', b''
+            return ''
         if not b:
-            return '', b''
+            return ''
         buf += b
         if b == b'\n':
             break
-    return buf.decode('ascii', errors='replace').strip(), b''
+    return buf.decode('ascii', errors='replace').strip()
 
 
+# ── Handle one relay connection ───────────────────────────────────────────────
 def _handle(conn: socket.socket):
     conn.settimeout(15)
     try:
-        # Peek first byte to detect HTTP health checks
-        first = conn.recv(1, socket.MSG_PEEK)
-        if not first:
-            conn.close()
-            return
-        # HTTP methods start with a letter followed by more letters (GET, POST, HEAD, etc.)
-        if first[0:1] in (b'G', b'P', b'H', b'D', b'O', b'C', b'T'):
-            # Likely an HTTP health check — drain and respond 200 OK
-            try:
-                conn.recv(4096)  # drain the request
-            except Exception:
-                pass
-            try:
-                conn.sendall(
-                    b'HTTP/1.1 200 OK\r\n'
-                    b'Content-Length: 2\r\n'
-                    b'Connection: close\r\n\r\nOK'
-                )
-            except Exception:
-                pass
-            conn.close()
-            return
-
-        # Relay protocol
-        line, _ = _readline(conn)
+        line = _readline(conn)
         if not line or ':' not in line:
             conn.close()
             return
@@ -160,12 +145,44 @@ def _handle(conn: socket.socket):
         except Exception: pass
 
 
-def main():
+# ── HTTP health-check server (Railway web process requirement) ────────────────
+def _http_health(port: int):
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(('0.0.0.0', PORT))
+    srv.bind(('0.0.0.0', port))
+    srv.listen(16)
+    print(f'[relay] HTTP health-check listening on port {port}')
+    while True:
+        try:
+            c, _ = srv.accept()
+            try:
+                c.recv(4096)
+                c.sendall(
+                    b'HTTP/1.1 200 OK\r\n'
+                    b'Content-Length: 2\r\n'
+                    b'Connection: close\r\n\r\nOK'
+                )
+            except Exception:
+                pass
+            finally:
+                try: c.close()
+                except Exception: pass
+        except Exception:
+            pass
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+def main():
+    # Start HTTP health-check thread if Railway gave us a separate PORT
+    if HTTP_PORT and HTTP_PORT != RELAY_PORT:
+        threading.Thread(target=_http_health, args=(HTTP_PORT,), daemon=True).start()
+
+    # Start relay TCP server
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(('0.0.0.0', RELAY_PORT))
     srv.listen(100)
-    print(f'HotSpell relay listening on port {PORT}')
+    print(f'[relay] HotSpell relay listening on port {RELAY_PORT}')
     while True:
         try:
             c, addr = srv.accept()
@@ -175,3 +192,4 @@ def main():
 
 
 main()
+
