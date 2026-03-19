@@ -1,1 +1,1 @@
-worker: python relay.py
+web: python relay.py
