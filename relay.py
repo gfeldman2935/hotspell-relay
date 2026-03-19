@@ -1,24 +1,16 @@
 """
-HotSpell Relay Server
-Deploy on Railway (or any host with a public TCP port).
-Two players connect with a shared 6-character room code;
-the server pairs them and forwards bytes transparently.
-
-Railway requires a web process to respond to HTTP health checks.
-This server runs a minimal HTTP health-check listener on PORT (Railway's
-assigned HTTP port) and the relay on RELAY_PORT (our TCP proxy target).
+HotSpell Relay Server — Railway deployment
+Listens on Railway's assigned PORT.
+Detects HTTP health checks (no colon in first line) vs relay protocol (HOST:/JOIN:).
 """
 import os, socket, threading, secrets, time
 
-# Railway assigns PORT for its HTTP health-check; we use RELAY_PORT for the relay.
-HTTP_PORT  = int(os.environ.get('PORT', 0))          # Railway health-check port
-RELAY_PORT = int(os.environ.get('RELAY_PORT', 8080)) # TCP proxy target port
+PORT = int(os.environ.get('PORT', 8080))
 
 _rooms: dict = {}
 _lock         = threading.Lock()
 
 
-# ── Cleanup stale rooms ───────────────────────────────────────────────────────
 def _cleanup():
     while True:
         time.sleep(60)
@@ -35,7 +27,6 @@ def _cleanup():
 threading.Thread(target=_cleanup, daemon=True).start()
 
 
-# ── Byte-pipe between two sockets ─────────────────────────────────────────────
 def _pipe(src: socket.socket, dst: socket.socket):
     try:
         while True:
@@ -53,10 +44,9 @@ def _pipe(src: socket.socket, dst: socket.socket):
             except Exception: pass
 
 
-# ── Read one line from socket ─────────────────────────────────────────────────
 def _readline(conn: socket.socket) -> str:
     buf = b''
-    while len(buf) < 64:
+    while len(buf) < 256:
         try:
             b = conn.recv(1)
         except Exception:
@@ -69,12 +59,26 @@ def _readline(conn: socket.socket) -> str:
     return buf.decode('ascii', errors='replace').strip()
 
 
-# ── Handle one relay connection ───────────────────────────────────────────────
 def _handle(conn: socket.socket):
     conn.settimeout(15)
     try:
         line = _readline(conn)
-        if not line or ':' not in line:
+        if not line:
+            conn.close()
+            return
+
+        # HTTP health check: request line has no colon (e.g. "GET / HTTP/1.1")
+        # Relay protocol always has colon: "HOST:" or "JOIN:ABCDEF"
+        if ':' not in line:
+            try:
+                conn.recv(4096)  # drain remaining headers
+                conn.sendall(
+                    b'HTTP/1.1 200 OK\r\n'
+                    b'Content-Length: 2\r\n'
+                    b'Connection: close\r\n\r\nOK'
+                )
+            except Exception:
+                pass
             conn.close()
             return
 
@@ -145,44 +149,12 @@ def _handle(conn: socket.socket):
         except Exception: pass
 
 
-# ── HTTP health-check server (Railway web process requirement) ────────────────
-def _http_health(port: int):
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(('0.0.0.0', port))
-    srv.listen(16)
-    print(f'[relay] HTTP health-check listening on port {port}')
-    while True:
-        try:
-            c, _ = srv.accept()
-            try:
-                c.recv(4096)
-                c.sendall(
-                    b'HTTP/1.1 200 OK\r\n'
-                    b'Content-Length: 2\r\n'
-                    b'Connection: close\r\n\r\nOK'
-                )
-            except Exception:
-                pass
-            finally:
-                try: c.close()
-                except Exception: pass
-        except Exception:
-            pass
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    # Start HTTP health-check thread if Railway gave us a separate PORT
-    if HTTP_PORT and HTTP_PORT != RELAY_PORT:
-        threading.Thread(target=_http_health, args=(HTTP_PORT,), daemon=True).start()
-
-    # Start relay TCP server
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(('0.0.0.0', RELAY_PORT))
+    srv.bind(('0.0.0.0', PORT))
     srv.listen(100)
-    print(f'[relay] HotSpell relay listening on port {RELAY_PORT}')
+    print(f'[relay] HotSpell relay listening on port {PORT}')
     while True:
         try:
             c, addr = srv.accept()
@@ -192,3 +164,5 @@ def main():
 
 
 main()
+
+
