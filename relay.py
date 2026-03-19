@@ -59,7 +59,19 @@ def _readline(conn: socket.socket) -> str:
     return buf.decode('ascii', errors='replace').strip()
 
 
+def _set_keepalive(s: socket.socket):
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        if hasattr(socket, 'TCP_KEEPIDLE'):
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 6)
+    except Exception:
+        pass
+
+
 def _handle(conn: socket.socket):
+    _set_keepalive(conn)
     conn.settimeout(15)
     try:
         line = _readline(conn)
@@ -164,5 +176,3 @@ def main():
 
 
 main()
-
-
