@@ -3,6 +3,7 @@ HotSpell Relay Server
 Deploy on Railway (or any host with a public TCP port).
 Two players connect with a shared 6-character room code;
 the server pairs them and forwards bytes transparently.
+Handles Railway HTTP health checks on the same port.
 """
 import os, socket, threading, secrets, time
 
@@ -44,25 +45,50 @@ def _pipe(src: socket.socket, dst: socket.socket):
             except Exception: pass
 
 
-def _readline(conn: socket.socket) -> str:
+def _readline(conn: socket.socket) -> tuple:
+    """Read first line; also return any bytes already peeked."""
     buf = b''
     while len(buf) < 64:
         try:
             b = conn.recv(1)
         except Exception:
-            return ''
+            return '', b''
         if not b:
-            return ''
+            return '', b''
         buf += b
         if b == b'\n':
             break
-    return buf.decode('ascii', errors='replace').strip()
+    return buf.decode('ascii', errors='replace').strip(), b''
 
 
 def _handle(conn: socket.socket):
     conn.settimeout(15)
     try:
-        line = _readline(conn)
+        # Peek first byte to detect HTTP health checks
+        first = conn.recv(1, socket.MSG_PEEK)
+        if not first:
+            conn.close()
+            return
+        # HTTP methods start with a letter followed by more letters (GET, POST, HEAD, etc.)
+        if first[0:1] in (b'G', b'P', b'H', b'D', b'O', b'C', b'T'):
+            # Likely an HTTP health check — drain and respond 200 OK
+            try:
+                conn.recv(4096)  # drain the request
+            except Exception:
+                pass
+            try:
+                conn.sendall(
+                    b'HTTP/1.1 200 OK\r\n'
+                    b'Content-Length: 2\r\n'
+                    b'Connection: close\r\n\r\nOK'
+                )
+            except Exception:
+                pass
+            conn.close()
+            return
+
+        # Relay protocol
+        line, _ = _readline(conn)
         if not line or ':' not in line:
             conn.close()
             return
