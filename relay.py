@@ -193,6 +193,29 @@ def _handle_http(conn: socket.socket, first_line: str):
                 _json(conn, 200, success=True, note='no license_key in payload')
             return
 
+        # POST /webhook/email  — Make.com sends raw Gmail body; server extracts key via regex
+        if path == '/webhook/email' and method == 'POST':
+            import re as _re
+            text = body.decode('utf-8', errors='replace')
+            qs_params = dict(urllib.parse.parse_qsl(text))
+            email_body = qs_params.get('body', text)
+            secret = qs_params.get('secret', '')
+            if ADMIN_SECRET and secret != ADMIN_SECRET:
+                _json(conn, 403, error='forbidden')
+                return
+            matches = _re.findall(r'[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}', email_body.upper())
+            if not matches:
+                print(f'[email-webhook] no key found in body (len={len(email_body)})')
+                _json(conn, 200, success=False, note='no license key found in email body')
+                return
+            added = []
+            for key in set(matches):
+                if _key_add(key):
+                    added.append(key)
+            print(f'[email-webhook] added {len(added)} key(s): {added}')
+            _json(conn, 200, success=True, keys_added=len(added), keys=added)
+            return
+
         # POST /validate   body: key=XXXXX-XXXXX-XXXXX-XXXXX
         if path == '/validate' and method == 'POST':
             params = {}
