@@ -423,9 +423,9 @@ def _handle(conn: socket.socket):
             print(f'[relay] guest joined room {code}')
 
         elif role == 'AIHOST':
-            # An AI server offering itself. Waits in the pool until a player
-            # asks for a CPU game, then behaves exactly like a HOST.
-            entry = {'conn': conn, 'guest': None,
+            # An AI server offering itself. Waits in the pool until a PLAYAI
+            # thread has PROVEN it alive (see PLAYAI) and paired a player.
+            entry = {'conn': conn, 'guest': None, 'ok': False,
                      'event': threading.Event(), 'ts': time.monotonic()}
             with _lock:
                 _ai_hosts.append(entry)
@@ -434,53 +434,78 @@ def _handle(conn: socket.socket):
             print(f'[relay] AI host registered ({waiting} waiting)')
 
             conn.settimeout(None)
-            if not entry['event'].wait(timeout=3600):
+            while not entry['event'].wait(timeout=3600):
                 with _lock:
-                    if entry in _ai_hosts:
+                    if entry in _ai_hosts:          # still unclaimed: retire it
                         _ai_hosts.remove(entry)
-                conn.close()
-                return
+                        conn.close()
+                        return
+                # claimed by a PLAYAI thread at the deadline: wait for its verdict
 
-            guest = entry['guest']
-            if guest is None:
-                conn.close()
+            if not entry['ok']:
+                try: conn.close()
+                except Exception: pass
                 return
-            # 'GO <level>' when the player chose one (PLAYAI:guru), bare 'GO'
-            # otherwise - the AI host then keeps its own --ai-level.
-            lvl = entry.get('level', '')
-            conn.sendall(f'GO {lvl}\n'.encode() if lvl else b'GO\n')
+            guest = entry['guest']
             print('[relay] AI game paired')
             t = threading.Thread(target=_pipe, args=(guest, conn), daemon=True)
             t.start()
             _pipe(conn, guest)
 
         elif role == 'PLAYAI':
-            # A player asking for a CPU opponent. Take the first AI server in
-            # the pool; if there is none, say so plainly so the client can tell
-            # the user instead of hanging on a connection that will never pair.
-            # Optional level: 'PLAYAI:novice' / 'PLAYAI:expert' / 'PLAYAI:guru'.
-            # Anything else (including bare 'PLAYAI:') = the host's default.
+            # A player asking for a CPU opponent. Optional level:
+            # 'PLAYAI:novice' / 'PLAYAI:expert' / 'PLAYAI:guru'; anything else
+            # (including bare 'PLAYAI:') = the host's default.
+            #
+            # LIVENESS (2026-11-14): a host whose PC slept or was killed can
+            # sit in the pool with a socket that still LOOKS open, and the
+            # player would get GO and then hang forever. So the host is told
+            # first ('GO <level>') and must answer within 15 s - a live AI
+            # host sends its 'seed' at once. Only then does the player get
+            # GO (followed by those first bytes). A dead host is dropped and
+            # the next one tried; none left = NOAI.
             level = code.lower() if code.lower() in ('novice', 'expert', 'guru') else ''
-            entry = None
-            with _lock:
-                while _ai_hosts:
-                    cand = _ai_hosts.pop(0)
-                    if cand['guest'] is None:
-                        entry = cand
-                        entry['level'] = level
-                        entry['guest'] = conn
-                        break
-            if entry is None:
-                conn.sendall(b'NOAI\n')
-                conn.close()
-                print('[relay] PLAYAI requested but no AI host available')
+            while True:
+                entry = None
+                with _lock:
+                    while _ai_hosts:
+                        cand = _ai_hosts.pop(0)
+                        if cand['guest'] is None:
+                            entry = cand
+                            break
+                if entry is None:
+                    conn.sendall(b'NOAI\n')
+                    conn.close()
+                    print('[relay] PLAYAI requested but no AI host available')
+                    return
+                hc = entry['conn']
+                try:
+                    hc.sendall(f'GO {level}\n'.encode() if level else b'GO\n')
+                    hc.settimeout(15)
+                    first = hc.recv(65536)
+                    hc.settimeout(None)
+                    if not first:
+                        raise ConnectionError('closed')
+                except Exception as e:
+                    entry['ok'] = False
+                    entry['event'].set()            # its AIHOST thread closes it
+                    print(f'[relay] AI host did not answer ({e}) - dropped, trying next')
+                    continue
+                conn.settimeout(None)
+                try:
+                    conn.sendall(b'GO\n' + first)
+                except Exception:
+                    entry['ok'] = False             # player left meanwhile; the
+                    entry['event'].set()            # host exits and is restarted
+                    conn.close()
+                    return
+                entry['guest'] = conn
+                entry['ok'] = True
+                entry['event'].set()
+                print(f'[relay] player matched to AI host (level {level or "default"})')
+                # NOT closed here: the AIHOST thread pipes this socket, exactly
+                # as the HOST thread pipes a JOIN guest.
                 return
-            conn.settimeout(None)
-            conn.sendall(b'GO\n')
-            entry['event'].set()
-            print(f'[relay] player matched to AI host (level {level or "default"})')
-            # NOT closed here: the AIHOST thread pipes this socket, exactly as
-            # the HOST thread pipes a JOIN guest. Closing it would kill the game.
 
         else:
             conn.close()
